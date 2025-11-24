@@ -51,5 +51,5 @@ jobs:
 
       - name: Show binary info
         run: |
-          ls -lh codex-rs/target/release/codex-tui.exe
-          file codex-rs/target/release/codex-tui.exe || true
+          Get-ChildItem codex-rs/target/release/codex-tui.exe | Select-Object Name, Length, LastWriteTime
+        shell: pwsh
