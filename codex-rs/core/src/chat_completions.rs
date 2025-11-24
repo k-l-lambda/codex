@@ -329,8 +329,8 @@ pub(crate) async fn stream_chat_completions(
         }
     }
 
-    // VERSION MARKER: v3-tool-call-filter-with-logging
-    debug!("chat_completions v3: Starting tool call filter check, messages.len()={}", messages.len());
+    // VERSION MARKER: v4-proper-tool-call-validation
+    debug!("chat_completions v4: Starting tool call validation, messages.len()={}", messages.len());
 
     // Log last 3 messages for debugging
     let start_idx = messages.len().saturating_sub(3);
@@ -346,33 +346,67 @@ pub(crate) async fn stream_chat_completions(
         }
     }
 
-    // Filter out trailing incomplete tool calls to prevent 400 errors from strict
-    // API providers (like JIEKOU) that validate every assistant message with tool_calls
-    // must be immediately followed by matching tool response messages.
-    // This handles the case where a request fails during/after a tool_call but before
-    // the tool response is recorded, and retry would send incomplete conversation history.
-    let mut removed_count = 0;
-    while let Some(last_msg) = messages.last() {
-        // Check if the last message is an assistant message with tool_calls
-        if let Some(obj) = last_msg.as_object() {
+    // Collect all tool_call_ids from assistant messages with tool_calls
+    let mut expected_tool_call_ids = std::collections::HashSet::new();
+    for msg in &messages {
+        if let Some(obj) = msg.as_object() {
             if obj.get("role").and_then(|v| v.as_str()) == Some("assistant")
-                && obj.contains_key("tool_calls")
+                && let Some(tool_calls) = obj.get("tool_calls").and_then(|v| v.as_array())
             {
-                // Found trailing tool_call without response - remove it
-                debug!("Removing trailing incomplete tool_call to avoid API validation error");
-                messages.pop();
-                removed_count += 1;
-                continue;
+                for tc in tool_calls {
+                    if let Some(id) = tc.get("id").and_then(|v| v.as_str()) {
+                        expected_tool_call_ids.insert(id.to_string());
+                    }
+                }
             }
         }
-        // Last message is not an incomplete tool_call, stop checking
-        break;
     }
 
-    if removed_count > 0 {
-        debug!("Removed {} trailing incomplete tool_call(s), final messages.len()={}", removed_count, messages.len());
+    // Collect all tool_call_ids from tool response messages
+    let mut provided_tool_call_ids = std::collections::HashSet::new();
+    for msg in &messages {
+        if let Some(obj) = msg.as_object() {
+            if obj.get("role").and_then(|v| v.as_str()) == Some("tool")
+                && let Some(id) = obj.get("tool_call_id").and_then(|v| v.as_str())
+            {
+                provided_tool_call_ids.insert(id.to_string());
+            }
+        }
+    }
+
+    // Find incomplete tool calls (those without responses)
+    let incomplete_ids: Vec<String> = expected_tool_call_ids
+        .difference(&provided_tool_call_ids)
+        .cloned()
+        .collect();
+
+    if !incomplete_ids.is_empty() {
+        debug!("Found {} incomplete tool call(s): {:?}", incomplete_ids.len(), incomplete_ids);
+
+        // Remove assistant messages with incomplete tool calls
+        let mut removed_count = 0;
+        messages.retain(|msg| {
+            if let Some(obj) = msg.as_object() {
+                if obj.get("role").and_then(|v| v.as_str()) == Some("assistant")
+                    && let Some(tool_calls) = obj.get("tool_calls").and_then(|v| v.as_array())
+                {
+                    for tc in tool_calls {
+                        if let Some(id) = tc.get("id").and_then(|v| v.as_str()) {
+                            if incomplete_ids.contains(&id.to_string()) {
+                                debug!("Removing assistant message with incomplete tool_call_id: {}", id);
+                                removed_count += 1;
+                                return false;
+                            }
+                        }
+                    }
+                }
+            }
+            true
+        });
+
+        debug!("Removed {} message(s) with incomplete tool calls, final messages.len()={}", removed_count, messages.len());
     } else {
-        debug!("No trailing incomplete tool_calls found");
+        debug!("All tool calls have matching responses");
     }
 
     let tools_json = create_tools_json_for_chat_completions_api(&prompt.tools)?;
