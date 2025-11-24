@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - test/pool-idle-timeout-config
+      - fix/filter-incomplete-tool-calls
   workflow_dispatch:
 
 jobs:
