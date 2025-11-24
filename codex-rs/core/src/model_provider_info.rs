@@ -93,6 +93,12 @@ pub struct ModelProviderInfo {
     /// the connection as lost.
     pub stream_idle_timeout_ms: Option<u64>,
 
+    /// Connection pool idle timeout (in seconds). How long to keep idle connections alive
+    /// in the connection pool before closing them. Set to 0 to disable connection pooling entirely.
+    /// If not specified, uses reqwest's default behavior (90 seconds).
+    /// Useful for providers that aggressively close connections server-side.
+    pub pool_idle_timeout_secs: Option<u64>,
+
     /// Does this provider require an OpenAI API Key or ChatGPT login token? If true,
     /// user is presented with login screen on first run, and login preference and token/key
     /// are stored in auth.json. If false (which is the default), login screen is skipped,
@@ -210,6 +216,13 @@ impl ModelProviderInfo {
             .map(Duration::from_millis)
             .unwrap_or(Duration::from_millis(DEFAULT_STREAM_IDLE_TIMEOUT_MS))
     }
+    /// Effective connection pool idle timeout. Returns None if not configured (use reqwest default),
+    /// Some(Duration::ZERO) if pooling should be disabled, or Some(duration) for a specific timeout.
+    pub fn pool_idle_timeout(&self) -> Option<Duration> {
+        self.pool_idle_timeout_secs
+            .map(|secs| Duration::from_secs(secs))
+    }
+
     pub fn create_openai_provider() -> ModelProviderInfo {
         ModelProviderInfo {
             name: OPENAI_PROVIDER_NAME.into(),
@@ -246,6 +259,7 @@ impl ModelProviderInfo {
             request_max_retries: None,
             stream_max_retries: None,
             stream_idle_timeout_ms: None,
+            pool_idle_timeout_secs: None,
             requires_openai_auth: true,
         }
     }
@@ -319,6 +333,7 @@ pub fn create_oss_provider_with_base_url(base_url: &str, wire_api: WireApi) -> M
         request_max_retries: None,
         stream_max_retries: None,
         stream_idle_timeout_ms: None,
+        pool_idle_timeout_secs: None,
         requires_openai_auth: false,
     }
 }
@@ -347,6 +362,7 @@ base_url = "http://localhost:11434/v1"
             request_max_retries: None,
             stream_max_retries: None,
             stream_idle_timeout_ms: None,
+            pool_idle_timeout_secs: None,
             requires_openai_auth: false,
         };
 
@@ -377,6 +393,7 @@ query_params = { api-version = "2025-04-01-preview" }
             request_max_retries: None,
             stream_max_retries: None,
             stream_idle_timeout_ms: None,
+            pool_idle_timeout_secs: None,
             requires_openai_auth: false,
         };
 
@@ -410,6 +427,7 @@ env_http_headers = { "X-Example-Env-Header" = "EXAMPLE_ENV_VAR" }
             request_max_retries: None,
             stream_max_retries: None,
             stream_idle_timeout_ms: None,
+            pool_idle_timeout_secs: None,
             requires_openai_auth: false,
         };
 
@@ -441,6 +459,7 @@ env_http_headers = { "X-Example-Env-Header" = "EXAMPLE_ENV_VAR" }
                 request_max_retries: None,
                 stream_max_retries: None,
                 stream_idle_timeout_ms: None,
+                pool_idle_timeout_secs: None,
                 requires_openai_auth: false,
             };
             let api = provider.to_api_provider(None).expect("api provider");
@@ -463,6 +482,7 @@ env_http_headers = { "X-Example-Env-Header" = "EXAMPLE_ENV_VAR" }
             request_max_retries: None,
             stream_max_retries: None,
             stream_idle_timeout_ms: None,
+            pool_idle_timeout_secs: None,
             requires_openai_auth: false,
         };
         let named_api = named_provider.to_api_provider(None).expect("api provider");
@@ -487,6 +507,7 @@ env_http_headers = { "X-Example-Env-Header" = "EXAMPLE_ENV_VAR" }
                 request_max_retries: None,
                 stream_max_retries: None,
                 stream_idle_timeout_ms: None,
+                pool_idle_timeout_secs: None,
                 requires_openai_auth: false,
             };
             let api = provider.to_api_provider(None).expect("api provider");
