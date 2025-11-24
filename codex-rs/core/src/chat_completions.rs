@@ -329,8 +329,8 @@ pub(crate) async fn stream_chat_completions(
         }
     }
 
-    // VERSION MARKER: v4-proper-tool-call-validation
-    debug!("chat_completions v4: Starting tool call validation, messages.len()={}", messages.len());
+    // VERSION MARKER: v5-enforce-tool-call-sequence
+    debug!("chat_completions v5: Starting tool call validation with sequence enforcement, messages.len()={}", messages.len());
 
     // Log last 3 messages for debugging
     let start_idx = messages.len().saturating_sub(3);
@@ -407,6 +407,80 @@ pub(crate) async fn stream_chat_completions(
         debug!("Removed {} message(s) with incomplete tool calls, final messages.len()={}", removed_count, messages.len());
     } else {
         debug!("All tool calls have matching responses");
+    }
+
+    // SEQUENCE VALIDATION: OpenAI protocol requires assistant messages with tool_calls
+    // to be immediately followed by tool response messages. Remove any messages that
+    // violate this ordering constraint.
+    debug!("chat_completions v5: Starting sequence validation");
+    let mut i = 0;
+    let mut removed_sequence_violations = 0;
+    while i < messages.len() {
+        if let Some(obj) = messages[i].as_object() {
+            // Check if this is an assistant message with tool_calls
+            if obj.get("role").and_then(|v| v.as_str()) == Some("assistant")
+                && obj.contains_key("tool_calls")
+            {
+                // Extract all tool_call_ids from this message
+                let mut call_ids = std::collections::HashSet::new();
+                if let Some(tool_calls) = obj.get("tool_calls").and_then(|v| v.as_array()) {
+                    for tc in tool_calls {
+                        if let Some(id) = tc.get("id").and_then(|v| v.as_str()) {
+                            call_ids.insert(id.to_string());
+                        }
+                    }
+                }
+
+                debug!("  Found assistant message with tool_calls at index {}, call_ids: {:?}", i, call_ids);
+
+                // Now scan forward to find all corresponding tool responses
+                let mut j = i + 1;
+                let mut found_responses = std::collections::HashSet::new();
+
+                while j < messages.len() {
+                    if let Some(next_obj) = messages[j].as_object() {
+                        let next_role = next_obj.get("role").and_then(|v| v.as_str());
+
+                        if next_role == Some("tool") {
+                            // This is a tool response
+                            if let Some(tool_call_id) = next_obj.get("tool_call_id").and_then(|v| v.as_str()) {
+                                if call_ids.contains(tool_call_id) {
+                                    found_responses.insert(tool_call_id.to_string());
+                                    debug!("    Found matching tool response at index {}: {}", j, tool_call_id);
+                                }
+                            }
+                            j += 1;
+                        } else {
+                            // Non-tool message found before all tool responses collected
+                            // Check if we've found all responses
+                            if found_responses.len() < call_ids.len() {
+                                // Incomplete sequence! Remove the intruding message
+                                debug!("    VIOLATION: Found {} message at index {} before all tool responses (found {}/{} responses)",
+                                    next_role.unwrap_or("unknown"), j, found_responses.len(), call_ids.len());
+                                debug!("    Removing message at index {} to fix sequence", j);
+                                messages.remove(j);
+                                removed_sequence_violations += 1;
+                                // Don't increment j, check the same position again
+                                continue;
+                            } else {
+                                // All responses found, this is the next turn
+                                break;
+                            }
+                        }
+                    } else {
+                        j += 1;
+                    }
+                }
+            }
+        }
+        i += 1;
+    }
+
+    if removed_sequence_violations > 0 {
+        debug!("Removed {} message(s) violating tool_call sequence, final messages.len()={}",
+            removed_sequence_violations, messages.len());
+    } else {
+        debug!("No sequence violations found");
     }
 
     let tools_json = create_tools_json_for_chat_completions_api(&prompt.tools)?;
