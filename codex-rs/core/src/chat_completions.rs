@@ -329,11 +329,29 @@ pub(crate) async fn stream_chat_completions(
         }
     }
 
+    // VERSION MARKER: v3-tool-call-filter-with-logging
+    debug!("chat_completions v3: Starting tool call filter check, messages.len()={}", messages.len());
+
+    // Log last 3 messages for debugging
+    let start_idx = messages.len().saturating_sub(3);
+    for (i, msg) in messages[start_idx..].iter().enumerate() {
+        if let Some(obj) = msg.as_object() {
+            let role = obj.get("role").and_then(|v| v.as_str()).unwrap_or("unknown");
+            let has_tool_calls = obj.contains_key("tool_calls");
+            let has_tool_call_id = obj.contains_key("tool_call_id");
+            debug!(
+                "  msg[{}]: role={}, has_tool_calls={}, has_tool_call_id={}",
+                start_idx + i, role, has_tool_calls, has_tool_call_id
+            );
+        }
+    }
+
     // Filter out trailing incomplete tool calls to prevent 400 errors from strict
     // API providers (like JIEKOU) that validate every assistant message with tool_calls
     // must be immediately followed by matching tool response messages.
     // This handles the case where a request fails during/after a tool_call but before
     // the tool response is recorded, and retry would send incomplete conversation history.
+    let mut removed_count = 0;
     while let Some(last_msg) = messages.last() {
         // Check if the last message is an assistant message with tool_calls
         if let Some(obj) = last_msg.as_object() {
@@ -343,11 +361,18 @@ pub(crate) async fn stream_chat_completions(
                 // Found trailing tool_call without response - remove it
                 debug!("Removing trailing incomplete tool_call to avoid API validation error");
                 messages.pop();
+                removed_count += 1;
                 continue;
             }
         }
         // Last message is not an incomplete tool_call, stop checking
         break;
+    }
+
+    if removed_count > 0 {
+        debug!("Removed {} trailing incomplete tool_call(s), final messages.len()={}", removed_count, messages.len());
+    } else {
+        debug!("No trailing incomplete tool_calls found");
     }
 
     let tools_json = create_tools_json_for_chat_completions_api(&prompt.tools)?;
