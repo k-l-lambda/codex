@@ -329,6 +329,27 @@ pub(crate) async fn stream_chat_completions(
         }
     }
 
+    // Filter out trailing incomplete tool calls to prevent 400 errors from strict
+    // API providers (like JIEKOU) that validate every assistant message with tool_calls
+    // must be immediately followed by matching tool response messages.
+    // This handles the case where a request fails during/after a tool_call but before
+    // the tool response is recorded, and retry would send incomplete conversation history.
+    while let Some(last_msg) = messages.last() {
+        // Check if the last message is an assistant message with tool_calls
+        if let Some(obj) = last_msg.as_object() {
+            if obj.get("role").and_then(|v| v.as_str()) == Some("assistant")
+                && obj.contains_key("tool_calls")
+            {
+                // Found trailing tool_call without response - remove it
+                debug!("Removing trailing incomplete tool_call to avoid API validation error");
+                messages.pop();
+                continue;
+            }
+        }
+        // Last message is not an incomplete tool_call, stop checking
+        break;
+    }
+
     let tools_json = create_tools_json_for_chat_completions_api(&prompt.tools)?;
     let payload = json!({
         "model": model_family.slug,
