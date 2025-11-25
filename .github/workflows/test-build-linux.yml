@@ -3,6 +3,7 @@ name: Test Build Linux Binary
 on:
   push:
     branches:
+      - develop
       - test/pool-idle-timeout-config
       - fix/filter-incomplete-tool-calls
   workflow_dispatch:
