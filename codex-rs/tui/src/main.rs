@@ -14,22 +14,6 @@ struct TopCli {
 }
 
 fn main() -> anyhow::Result<()> {
-    // On Windows, set console output to UTF-8 to prevent mojibake when printing Unicode characters.
-    // This ensures Chinese, Japanese, and other non-ASCII text display correctly instead of
-    // showing garbled byte sequences like <E7><9A><84>.
-    #[cfg(windows)]
-    {
-        use windows::Win32::System::Console::{GetConsoleOutputCP, SetConsoleOutputCP};
-        const CP_UTF8: u32 = 65001;
-
-        // Only change code page if not already UTF-8
-        unsafe {
-            if GetConsoleOutputCP() != CP_UTF8 {
-                SetConsoleOutputCP(CP_UTF8);
-            }
-        }
-    }
-
     arg0_dispatch_or_else(|codex_linux_sandbox_exe| async move {
         let top_cli = TopCli::parse();
         let mut inner = top_cli.inner;
