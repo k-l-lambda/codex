@@ -383,6 +383,10 @@ pub(crate) async fn stream_chat_completions(
     if !incomplete_ids.is_empty() {
         debug!("Found {} incomplete tool call(s): {:?}", incomplete_ids.len(), incomplete_ids);
 
+        // Collect tool_call_ids from assistant messages that will be removed.
+        // We need to also remove their corresponding tool responses.
+        let mut removed_assistant_call_ids = std::collections::HashSet::new();
+
         // Remove assistant messages with incomplete tool calls
         let mut removed_count = 0;
         messages.retain(|msg| {
@@ -390,10 +394,17 @@ pub(crate) async fn stream_chat_completions(
                 if obj.get("role").and_then(|v| v.as_str()) == Some("assistant")
                     && let Some(tool_calls) = obj.get("tool_calls").and_then(|v| v.as_array())
                 {
+                    // Check if this assistant message has any incomplete tool calls
                     for tc in tool_calls {
                         if let Some(id) = tc.get("id").and_then(|v| v.as_str()) {
                             if incomplete_ids.contains(&id.to_string()) {
                                 debug!("Removing assistant message with incomplete tool_call_id: {}", id);
+                                // Collect ALL tool_call_ids from this assistant message
+                                for tc2 in tool_calls {
+                                    if let Some(id2) = tc2.get("id").and_then(|v| v.as_str()) {
+                                        removed_assistant_call_ids.insert(id2.to_string());
+                                    }
+                                }
                                 removed_count += 1;
                                 return false;
                             }
@@ -405,6 +416,26 @@ pub(crate) async fn stream_chat_completions(
         });
 
         debug!("Removed {} message(s) with incomplete tool calls, final messages.len()={}", removed_count, messages.len());
+
+        // Remove tool response messages whose assistant origin was removed
+        if !removed_assistant_call_ids.is_empty() {
+            let mut removed_tool_count = 0;
+            messages.retain(|msg| {
+                if let Some(obj) = msg.as_object() {
+                    if obj.get("role").and_then(|v| v.as_str()) == Some("tool") {
+                        if let Some(tool_call_id) = obj.get("tool_call_id").and_then(|v| v.as_str()) {
+                            if removed_assistant_call_ids.contains(tool_call_id) {
+                                debug!("Removing orphaned tool response with tool_call_id: {}", tool_call_id);
+                                removed_tool_count += 1;
+                                return false;
+                            }
+                        }
+                    }
+                }
+                true
+            });
+            debug!("Removed {} orphaned tool response(s), final messages.len()={}", removed_tool_count, messages.len());
+        }
     } else {
         debug!("All tool calls have matching responses");
     }
