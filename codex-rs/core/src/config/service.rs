@@ -4,6 +4,7 @@ use crate::config::edit::ConfigEdit;
 use crate::config::edit::ConfigEditsBuilder;
 use crate::config_loader::ConfigLayerEntry;
 use crate::config_loader::ConfigLayerStack;
+use crate::config_loader::ConfigRequirementsToml;
 use crate::config_loader::LoaderOverrides;
 use crate::config_loader::load_config_layers_state;
 use crate::config_loader::merge_toml_values;
@@ -20,7 +21,9 @@ use codex_app_server_protocol::ConfigWriteResponse;
 use codex_app_server_protocol::MergeStrategy;
 use codex_app_server_protocol::OverriddenMetadata;
 use codex_app_server_protocol::WriteStatus;
+use codex_utils_absolute_path::AbsolutePathBuf;
 use serde_json::Value as JsonValue;
+use std::borrow::Cow;
 use std::path::Path;
 use std::path::PathBuf;
 use thiserror::Error;
@@ -104,16 +107,7 @@ pub struct ConfigService {
 }
 
 impl ConfigService {
-    pub fn new(codex_home: PathBuf, cli_overrides: Vec<(String, TomlValue)>) -> Self {
-        Self {
-            codex_home,
-            cli_overrides,
-            loader_overrides: LoaderOverrides::default(),
-        }
-    }
-
-    #[cfg(test)]
-    fn with_overrides(
+    pub fn new(
         codex_home: PathBuf,
         cli_overrides: Vec<(String, TomlValue)>,
         loader_overrides: LoaderOverrides,
@@ -125,12 +119,20 @@ impl ConfigService {
         }
     }
 
+    pub fn new_with_defaults(codex_home: PathBuf) -> Self {
+        Self {
+            codex_home,
+            cli_overrides: Vec::new(),
+            loader_overrides: LoaderOverrides::default(),
+        }
+    }
+
     pub async fn read(
         &self,
         params: ConfigReadParams,
     ) -> Result<ConfigReadResponse, ConfigServiceError> {
         let layers = self
-            .load_layers_state()
+            .load_thread_agnostic_config()
             .await
             .map_err(|err| ConfigServiceError::io("failed to read configuration layers", err))?;
 
@@ -146,8 +148,30 @@ impl ConfigService {
         Ok(ConfigReadResponse {
             config,
             origins: layers.origins(),
-            layers: params.include_layers.then(|| layers.layers_high_to_low()),
+            layers: params.include_layers.then(|| {
+                layers
+                    .layers_high_to_low()
+                    .iter()
+                    .map(|layer| layer.as_layer())
+                    .collect()
+            }),
         })
+    }
+
+    pub async fn read_requirements(
+        &self,
+    ) -> Result<Option<ConfigRequirementsToml>, ConfigServiceError> {
+        let layers = self
+            .load_thread_agnostic_config()
+            .await
+            .map_err(|err| ConfigServiceError::io("failed to read configuration layers", err))?;
+
+        let requirements = layers.requirements_toml().clone();
+        if requirements.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(requirements))
+        }
     }
 
     pub async fn write_value(
@@ -177,7 +201,7 @@ impl ConfigService {
         &self,
     ) -> Result<codex_app_server_protocol::UserSavedConfig, ConfigServiceError> {
         let layers = self
-            .load_layers_state()
+            .load_thread_agnostic_config()
             .await
             .map_err(|err| ConfigServiceError::io("failed to load configuration", err))?;
 
@@ -194,11 +218,14 @@ impl ConfigService {
         expected_version: Option<String>,
         edits: Vec<(String, JsonValue, MergeStrategy)>,
     ) -> Result<ConfigWriteResponse, ConfigServiceError> {
-        let allowed_path = self.codex_home.join(CONFIG_TOML_FILE);
-        let provided_path = file_path
-            .as_ref()
-            .map(PathBuf::from)
-            .unwrap_or_else(|| allowed_path.clone());
+        let allowed_path =
+            AbsolutePathBuf::resolve_path_against_base(CONFIG_TOML_FILE, &self.codex_home)
+                .map_err(|err| ConfigServiceError::io("failed to resolve user config path", err))?;
+        let provided_path = match file_path {
+            Some(path) => AbsolutePathBuf::from_absolute_path(PathBuf::from(path))
+                .map_err(|err| ConfigServiceError::io("failed to resolve user config path", err))?,
+            None => allowed_path.clone(),
+        };
 
         if !paths_match(&allowed_path, &provided_path) {
             return Err(ConfigServiceError::write(
@@ -208,12 +235,16 @@ impl ConfigService {
         }
 
         let layers = self
-            .load_layers_state()
+            .load_thread_agnostic_config()
             .await
             .map_err(|err| ConfigServiceError::io("failed to load configuration", err))?;
+        let user_layer = match layers.get_user_layer() {
+            Some(layer) => Cow::Borrowed(layer),
+            None => Cow::Owned(create_empty_user_layer(&allowed_path).await?),
+        };
 
         if let Some(expected) = expected_version.as_deref()
-            && expected != layers.user.version
+            && expected != user_layer.version
         {
             return Err(ConfigServiceError::write(
                 ConfigWriteErrorCode::ConfigVersionConflict,
@@ -221,7 +252,7 @@ impl ConfigService {
             ));
         }
 
-        let mut user_config = layers.user.config.clone();
+        let mut user_config = user_layer.config.clone();
         let mut parsed_segments = Vec::new();
         let mut config_edits = Vec::new();
 
@@ -273,7 +304,7 @@ impl ConfigService {
             )
         })?;
 
-        let updated_layers = layers.with_user_config(user_config.clone());
+        let updated_layers = layers.with_user_config(&provided_path, user_config.clone());
         let effective = updated_layers.effective_config();
         validate_config(&effective).map_err(|err| {
             ConfigServiceError::write(
@@ -296,28 +327,62 @@ impl ConfigService {
             .map(|_| WriteStatus::OkOverridden)
             .unwrap_or(WriteStatus::Ok);
 
-        let file_path = provided_path
-            .canonicalize()
-            .unwrap_or(provided_path.clone())
-            .display()
-            .to_string();
-
         Ok(ConfigWriteResponse {
             status,
-            version: updated_layers.user.version.clone(),
-            file_path,
+            version: updated_layers
+                .get_user_layer()
+                .ok_or_else(|| {
+                    ConfigServiceError::write(
+                        ConfigWriteErrorCode::UserLayerNotFound,
+                        "user layer not found in updated layers",
+                    )
+                })?
+                .version
+                .clone(),
+            file_path: provided_path,
             overridden_metadata: overridden,
         })
     }
 
-    async fn load_layers_state(&self) -> std::io::Result<ConfigLayerStack> {
+    /// Loads a "thread-agnostic" config, which means the config layers do not
+    /// include any in-repo .codex/ folders because there is no cwd/project root
+    /// associated with this query.
+    async fn load_thread_agnostic_config(&self) -> std::io::Result<ConfigLayerStack> {
+        let cwd: Option<AbsolutePathBuf> = None;
         load_config_layers_state(
             &self.codex_home,
+            cwd,
             &self.cli_overrides,
             self.loader_overrides.clone(),
         )
         .await
     }
+}
+
+async fn create_empty_user_layer(
+    config_toml: &AbsolutePathBuf,
+) -> Result<ConfigLayerEntry, ConfigServiceError> {
+    let toml_value = match tokio::fs::read_to_string(config_toml).await {
+        Ok(contents) => toml::from_str(&contents).map_err(|e| {
+            ConfigServiceError::toml("failed to parse existing user config.toml", e)
+        })?,
+        Err(e) => {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                tokio::fs::write(config_toml, "").await.map_err(|e| {
+                    ConfigServiceError::io("failed to create empty user config.toml", e)
+                })?;
+                TomlValue::Table(toml::map::Map::new())
+            } else {
+                return Err(ConfigServiceError::io("failed to read user config.toml", e));
+            }
+        }
+    };
+    Ok(ConfigLayerEntry::new(
+        ConfigLayerSource::User {
+            file: config_toml.clone(),
+        },
+        toml_value,
+    ))
 }
 
 fn parse_value(value: JsonValue) -> Result<Option<TomlValue>, String> {
@@ -470,15 +535,15 @@ fn validate_config(value: &TomlValue) -> Result<(), toml::de::Error> {
     Ok(())
 }
 
-fn paths_match(expected: &Path, provided: &Path) -> bool {
+fn paths_match(expected: impl AsRef<Path>, provided: impl AsRef<Path>) -> bool {
     if let (Ok(expanded_expected), Ok(expanded_provided)) = (
-        path_utils::normalize_for_path_comparison(expected),
-        path_utils::normalize_for_path_comparison(provided),
+        path_utils::normalize_for_path_comparison(&expected),
+        path_utils::normalize_for_path_comparison(&provided),
     ) {
-        return expanded_expected == expanded_provided;
+        expanded_expected == expanded_provided
+    } else {
+        expected.as_ref() == provided.as_ref()
     }
-
-    expected == provided
 }
 
 fn value_at_path<'a>(root: &'a TomlValue, segments: &[String]) -> Option<&'a TomlValue> {
@@ -501,10 +566,29 @@ fn value_at_path<'a>(root: &'a TomlValue, segments: &[String]) -> Option<&'a Tom
 
 fn override_message(layer: &ConfigLayerSource) -> String {
     match layer {
-        ConfigLayerSource::Mdm { .. } => "Overridden by managed policy (mdm)".to_string(),
-        ConfigLayerSource::System { .. } => "Overridden by managed config (system)".to_string(),
+        ConfigLayerSource::Mdm { domain, key: _ } => {
+            format!("Overridden by managed policy (MDM): {domain}")
+        }
+        ConfigLayerSource::System { file } => {
+            format!("Overridden by managed config (system): {}", file.display())
+        }
+        ConfigLayerSource::Project { dot_codex_folder } => format!(
+            "Overridden by project config: {}/{CONFIG_TOML_FILE}",
+            dot_codex_folder.display(),
+        ),
         ConfigLayerSource::SessionFlags => "Overridden by session flags".to_string(),
-        ConfigLayerSource::User { .. } => "Overridden by user config".to_string(),
+        ConfigLayerSource::User { file } => {
+            format!("Overridden by user config: {}", file.display())
+        }
+        ConfigLayerSource::LegacyManagedConfigTomlFromFile { file } => {
+            format!(
+                "Overridden by legacy managed_config.toml: {}",
+                file.display()
+            )
+        }
+        ConfigLayerSource::LegacyManagedConfigTomlFromMdm => {
+            "Overridden by legacy managed configuration from MDM".to_string()
+        }
     }
 }
 
@@ -513,7 +597,10 @@ fn compute_override_metadata(
     effective: &TomlValue,
     segments: &[String],
 ) -> Option<OverriddenMetadata> {
-    let user_value = value_at_path(&layers.user.config, segments);
+    let user_value = match layers.get_user_layer() {
+        Some(user_layer) => value_at_path(&user_layer.config, segments),
+        None => return None,
+    };
     let effective_value = value_at_path(effective, segments);
 
     if user_value.is_some() && user_value == effective_value {
@@ -524,8 +611,7 @@ fn compute_override_metadata(
         return None;
     }
 
-    let effective_layer = find_effective_layer(layers, segments);
-    let overriding_layer = effective_layer.unwrap_or_else(|| layers.user.metadata());
+    let overriding_layer = find_effective_layer(layers, segments)?;
     let message = override_message(&overriding_layer.name);
 
     Some(OverriddenMetadata {
@@ -554,23 +640,13 @@ fn find_effective_layer(
     layers: &ConfigLayerStack,
     segments: &[String],
 ) -> Option<ConfigLayerMetadata> {
-    let check =
-        |state: &ConfigLayerEntry| value_at_path(&state.config, segments).map(|_| state.metadata());
+    for layer in layers.layers_high_to_low() {
+        if let Some(meta) = value_at_path(&layer.config, segments).map(|_| layer.metadata()) {
+            return Some(meta);
+        }
+    }
 
-    if let Some(mdm) = &layers.mdm
-        && let Some(meta) = check(mdm)
-    {
-        return Some(meta);
-    }
-    if let Some(system) = &layers.system
-        && let Some(meta) = check(system)
-    {
-        return Some(meta);
-    }
-    if let Some(meta) = check(&layers.session_flags) {
-        return Some(meta);
-    }
-    check(&layers.user)
+    None
 }
 
 #[cfg(test)]
@@ -647,7 +723,7 @@ unified_exec = true
 "#;
         std::fs::write(tmp.path().join(CONFIG_TOML_FILE), original)?;
 
-        let service = ConfigService::new(tmp.path().to_path_buf(), vec![]);
+        let service = ConfigService::new_with_defaults(tmp.path().to_path_buf());
         service
             .write_value(ConfigValueWriteParams {
                 file_path: Some(tmp.path().join(CONFIG_TOML_FILE).display().to_string()),
@@ -688,13 +764,14 @@ remote_compaction = true
         std::fs::write(&managed_path, "approval_policy = \"never\"").unwrap();
         let managed_file = AbsolutePathBuf::try_from(managed_path.clone()).expect("managed file");
 
-        let service = ConfigService::with_overrides(
+        let service = ConfigService::new(
             tmp.path().to_path_buf(),
             vec![],
             LoaderOverrides {
                 managed_config_path: Some(managed_path.clone()),
                 #[cfg(target_os = "macos")]
                 managed_preferences_base64: None,
+                macos_managed_config_requirements_base64: None,
             },
         );
 
@@ -713,20 +790,46 @@ remote_compaction = true
                 .get("approval_policy")
                 .expect("origin")
                 .name,
-            ConfigLayerSource::System {
-                file: managed_file.clone(),
-            }
+            ConfigLayerSource::LegacyManagedConfigTomlFromFile {
+                file: managed_file.clone()
+            },
         );
         let layers = response.layers.expect("layers present");
-        assert_eq!(
-            layers.first().unwrap().name,
-            ConfigLayerSource::System { file: managed_file }
-        );
-        assert_eq!(layers.get(1).unwrap().name, ConfigLayerSource::SessionFlags);
-        assert_eq!(
-            layers.last().unwrap().name,
-            ConfigLayerSource::User { file: user_file }
-        );
+        if cfg!(unix) {
+            let system_file = AbsolutePathBuf::from_absolute_path(
+                crate::config_loader::SYSTEM_CONFIG_TOML_FILE_UNIX,
+            )
+            .expect("system file");
+            assert_eq!(layers.len(), 3, "expected three layers on unix");
+            assert_eq!(
+                layers.first().unwrap().name,
+                ConfigLayerSource::LegacyManagedConfigTomlFromFile {
+                    file: managed_file.clone()
+                }
+            );
+            assert_eq!(
+                layers.get(1).unwrap().name,
+                ConfigLayerSource::User {
+                    file: user_file.clone()
+                }
+            );
+            assert_eq!(
+                layers.get(2).unwrap().name,
+                ConfigLayerSource::System { file: system_file }
+            );
+        } else {
+            assert_eq!(layers.len(), 2, "expected two layers");
+            assert_eq!(
+                layers.first().unwrap().name,
+                ConfigLayerSource::LegacyManagedConfigTomlFromFile {
+                    file: managed_file.clone()
+                }
+            );
+            assert_eq!(
+                layers.get(1).unwrap().name,
+                ConfigLayerSource::User { file: user_file }
+            );
+        }
     }
 
     #[tokio::test]
@@ -742,13 +845,14 @@ remote_compaction = true
         std::fs::write(&managed_path, "approval_policy = \"never\"").unwrap();
         let managed_file = AbsolutePathBuf::try_from(managed_path.clone()).expect("managed file");
 
-        let service = ConfigService::with_overrides(
+        let service = ConfigService::new(
             tmp.path().to_path_buf(),
             vec![],
             LoaderOverrides {
                 managed_config_path: Some(managed_path.clone()),
                 #[cfg(target_os = "macos")]
                 managed_preferences_base64: None,
+                macos_managed_config_requirements_base64: None,
             },
         );
 
@@ -779,7 +883,9 @@ remote_compaction = true
                 .get("approval_policy")
                 .expect("origin")
                 .name,
-            ConfigLayerSource::System { file: managed_file }
+            ConfigLayerSource::LegacyManagedConfigTomlFromFile {
+                file: managed_file.clone()
+            }
         );
         assert_eq!(result.status, WriteStatus::Ok);
         assert!(result.overridden_metadata.is_none());
@@ -791,7 +897,7 @@ remote_compaction = true
         let user_path = tmp.path().join(CONFIG_TOML_FILE);
         std::fs::write(&user_path, "model = \"user\"").unwrap();
 
-        let service = ConfigService::new(tmp.path().to_path_buf(), vec![]);
+        let service = ConfigService::new_with_defaults(tmp.path().to_path_buf());
         let error = service
             .write_value(ConfigValueWriteParams {
                 file_path: Some(tmp.path().join(CONFIG_TOML_FILE).display().to_string()),
@@ -814,7 +920,7 @@ remote_compaction = true
         let tmp = tempdir().expect("tempdir");
         std::fs::write(tmp.path().join(CONFIG_TOML_FILE), "").unwrap();
 
-        let service = ConfigService::new(tmp.path().to_path_buf(), vec![]);
+        let service = ConfigService::new_with_defaults(tmp.path().to_path_buf());
         service
             .write_value(ConfigValueWriteParams {
                 file_path: None,
@@ -842,13 +948,14 @@ remote_compaction = true
         let managed_path = tmp.path().join("managed_config.toml");
         std::fs::write(&managed_path, "approval_policy = \"never\"").unwrap();
 
-        let service = ConfigService::with_overrides(
+        let service = ConfigService::new(
             tmp.path().to_path_buf(),
             vec![],
             LoaderOverrides {
                 managed_config_path: Some(managed_path.clone()),
                 #[cfg(target_os = "macos")]
                 managed_preferences_base64: None,
+                macos_managed_config_requirements_base64: None,
             },
         );
 
@@ -889,13 +996,14 @@ remote_compaction = true
             TomlValue::String("session".to_string()),
         )];
 
-        let service = ConfigService::with_overrides(
+        let service = ConfigService::new(
             tmp.path().to_path_buf(),
             cli_overrides,
             LoaderOverrides {
                 managed_config_path: Some(managed_path.clone()),
                 #[cfg(target_os = "macos")]
                 managed_preferences_base64: None,
+                macos_managed_config_requirements_base64: None,
             },
         );
 
@@ -909,14 +1017,14 @@ remote_compaction = true
         assert_eq!(response.config.model.as_deref(), Some("system"));
         assert_eq!(
             response.origins.get("model").expect("origin").name,
-            ConfigLayerSource::System {
-                file: managed_file.clone(),
-            }
+            ConfigLayerSource::LegacyManagedConfigTomlFromFile {
+                file: managed_file.clone()
+            },
         );
         let layers = response.layers.expect("layers");
         assert_eq!(
             layers.first().unwrap().name,
-            ConfigLayerSource::System { file: managed_file }
+            ConfigLayerSource::LegacyManagedConfigTomlFromFile { file: managed_file }
         );
         assert_eq!(layers.get(1).unwrap().name, ConfigLayerSource::SessionFlags);
         assert_eq!(
@@ -934,13 +1042,14 @@ remote_compaction = true
         std::fs::write(&managed_path, "approval_policy = \"never\"").unwrap();
         let managed_file = AbsolutePathBuf::try_from(managed_path.clone()).expect("managed file");
 
-        let service = ConfigService::with_overrides(
+        let service = ConfigService::new(
             tmp.path().to_path_buf(),
             vec![],
             LoaderOverrides {
                 managed_config_path: Some(managed_path.clone()),
                 #[cfg(target_os = "macos")]
                 managed_preferences_base64: None,
+                macos_managed_config_requirements_base64: None,
             },
         );
 
@@ -959,7 +1068,7 @@ remote_compaction = true
         let overridden = result.overridden_metadata.expect("overridden metadata");
         assert_eq!(
             overridden.overriding_layer.name,
-            ConfigLayerSource::System { file: managed_file }
+            ConfigLayerSource::LegacyManagedConfigTomlFromFile { file: managed_file }
         );
         assert_eq!(overridden.effective_value, serde_json::json!("never"));
     }
@@ -992,7 +1101,7 @@ alpha = "a"
 
         std::fs::write(&path, base)?;
 
-        let service = ConfigService::new(tmp.path().to_path_buf(), vec![]);
+        let service = ConfigService::new_with_defaults(tmp.path().to_path_buf());
         service
             .write_value(ConfigValueWriteParams {
                 file_path: Some(path.display().to_string()),

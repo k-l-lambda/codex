@@ -1,4 +1,7 @@
+use crate::key_hint;
+use crate::key_hint::KeyBinding;
 use crate::key_hint::has_ctrl_or_alt;
+use crate::transcript_copy_action::TranscriptCopyFeedback;
 use crossterm::event::KeyCode;
 use crossterm::event::KeyEvent;
 use crossterm::event::KeyEventKind;
@@ -73,6 +76,7 @@ const LARGE_PASTE_CHAR_THRESHOLD: usize = 1000;
 pub enum InputResult {
     Submitted(String),
     Command(SlashCommand),
+    CommandWithArgs(SlashCommand, String),
     None,
 }
 
@@ -109,6 +113,9 @@ pub(crate) struct ChatComposer {
     attached_images: Vec<AttachedImage>,
     placeholder_text: String,
     is_task_running: bool,
+    /// When false, the composer is temporarily read-only (e.g. during sandbox setup).
+    input_enabled: bool,
+    input_disabled_placeholder: Option<String>,
     // Non-bracketed paste burst tracker.
     paste_burst: PasteBurst,
     // When true, disables paste-burst logic and inserts characters immediately.
@@ -121,6 +128,8 @@ pub(crate) struct ChatComposer {
     transcript_scrolled: bool,
     transcript_selection_active: bool,
     transcript_scroll_position: Option<(usize, usize)>,
+    transcript_copy_selection_key: KeyBinding,
+    transcript_copy_feedback: Option<TranscriptCopyFeedback>,
     skills: Option<Vec<SkillMetadata>>,
     dismissed_skill_popup_token: Option<String>,
 }
@@ -162,6 +171,8 @@ impl ChatComposer {
             attached_images: Vec::new(),
             placeholder_text,
             is_task_running: false,
+            input_enabled: true,
+            input_disabled_placeholder: None,
             paste_burst: PasteBurst::default(),
             disable_paste_burst: false,
             custom_prompts: Vec::new(),
@@ -172,6 +183,8 @@ impl ChatComposer {
             transcript_scrolled: false,
             transcript_selection_active: false,
             transcript_scroll_position: None,
+            transcript_copy_selection_key: key_hint::ctrl_shift(KeyCode::Char('c')),
+            transcript_copy_feedback: None,
             skills: None,
             dismissed_skill_popup_token: None,
         };
@@ -397,6 +410,10 @@ impl ChatComposer {
 
     /// Handle a key event coming from the main UI.
     pub fn handle_key_event(&mut self, key_event: KeyEvent) -> (InputResult, bool) {
+        if !self.input_enabled {
+            return (InputResult::None, false);
+        }
+
         let result = match &mut self.active_popup {
             ActivePopup::Command(_) => self.handle_key_event_with_slash_popup(key_event),
             ActivePopup::File(_) => self.handle_key_event_with_file_popup(key_event),
@@ -1184,6 +1201,18 @@ impl ChatComposer {
                     }
                 }
 
+                if !input_starts_with_space
+                    && let Some((name, rest)) = parse_slash_name(&text)
+                    && !rest.is_empty()
+                    && !name.contains('/')
+                    && let Some((_n, cmd)) = built_in_slash_commands()
+                        .into_iter()
+                        .find(|(command_name, _)| *command_name == name)
+                    && cmd == SlashCommand::Review
+                {
+                    return (InputResult::CommandWithArgs(cmd, rest.to_string()), true);
+                }
+
                 let expanded_prompt = match expand_custom_prompt(&text, &self.custom_prompts) {
                     Ok(expanded) => expanded,
                     Err(err) => {
@@ -1540,6 +1569,8 @@ impl ChatComposer {
             transcript_scrolled: self.transcript_scrolled,
             transcript_selection_active: self.transcript_selection_active,
             transcript_scroll_position: self.transcript_scroll_position,
+            transcript_copy_selection_key: self.transcript_copy_selection_key,
+            transcript_copy_feedback: self.transcript_copy_feedback,
         }
     }
 
@@ -1571,10 +1602,24 @@ impl ChatComposer {
         scrolled: bool,
         selection_active: bool,
         scroll_position: Option<(usize, usize)>,
-    ) {
+        copy_selection_key: KeyBinding,
+        copy_feedback: Option<TranscriptCopyFeedback>,
+    ) -> bool {
+        if self.transcript_scrolled == scrolled
+            && self.transcript_selection_active == selection_active
+            && self.transcript_scroll_position == scroll_position
+            && self.transcript_copy_selection_key == copy_selection_key
+            && self.transcript_copy_feedback == copy_feedback
+        {
+            return false;
+        }
+
         self.transcript_scrolled = scrolled;
         self.transcript_selection_active = selection_active;
         self.transcript_scroll_position = scroll_position;
+        self.transcript_copy_selection_key = copy_selection_key;
+        self.transcript_copy_feedback = copy_feedback;
+        true
     }
 
     fn sync_popups(&mut self) {
@@ -1783,6 +1828,17 @@ impl ChatComposer {
         self.has_focus = has_focus;
     }
 
+    #[allow(dead_code)]
+    pub(crate) fn set_input_enabled(&mut self, enabled: bool, placeholder: Option<String>) {
+        self.input_enabled = enabled;
+        self.input_disabled_placeholder = if enabled { None } else { placeholder };
+
+        // Avoid leaving interactive popups open while input is blocked.
+        if !enabled && !matches!(self.active_popup, ActivePopup::None) {
+            self.active_popup = ActivePopup::None;
+        }
+    }
+
     pub fn set_task_running(&mut self, running: bool) {
         self.is_task_running = running;
     }
@@ -1808,6 +1864,10 @@ impl ChatComposer {
 
 impl Renderable for ChatComposer {
     fn cursor_pos(&self, area: Rect) -> Option<(u16, u16)> {
+        if !self.input_enabled {
+            return None;
+        }
+
         let [_, textarea_rect, _] = self.layout_areas(area);
         let state = *self.textarea_state.borrow();
         self.textarea.cursor_pos_with_state(textarea_rect, state)
@@ -1886,10 +1946,15 @@ impl Renderable for ChatComposer {
         let style = user_message_style();
         Block::default().style(style).render_ref(composer_rect, buf);
         if !textarea_rect.is_empty() {
+            let prompt = if self.input_enabled {
+                "›".bold()
+            } else {
+                "›".dim()
+            };
             buf.set_span(
                 textarea_rect.x - LIVE_PREFIX_COLS,
                 textarea_rect.y,
-                &"›".bold(),
+                &prompt,
                 textarea_rect.width,
             );
         }
@@ -1897,7 +1962,15 @@ impl Renderable for ChatComposer {
         let mut state = self.textarea_state.borrow_mut();
         StatefulWidgetRef::render_ref(&(&self.textarea), textarea_rect, buf, &mut state);
         if self.textarea.text().is_empty() {
-            let placeholder = Span::from(self.placeholder_text.as_str()).dim();
+            let text = if self.input_enabled {
+                self.placeholder_text.as_str().to_string()
+            } else {
+                self.input_disabled_placeholder
+                    .as_deref()
+                    .unwrap_or("Input disabled.")
+                    .to_string()
+            };
+            let placeholder = Span::from(text).dim().italic();
             Line::from(vec![placeholder]).render_ref(textarea_rect.inner(Margin::new(0, 0)), buf);
         }
     }
@@ -2731,10 +2804,51 @@ mod tests {
             InputResult::Command(cmd) => {
                 assert_eq!(cmd.command(), "init");
             }
+            InputResult::CommandWithArgs(_, _) => {
+                panic!("expected command dispatch without args for '/init'")
+            }
             InputResult::Submitted(text) => {
                 panic!("expected command dispatch, but composer submitted literal text: {text}")
             }
             InputResult::None => panic!("expected Command result for '/init'"),
+        }
+        assert!(composer.textarea.is_empty(), "composer should be cleared");
+    }
+
+    #[test]
+    fn slash_review_with_args_dispatches_command_with_args() {
+        use crossterm::event::KeyCode;
+        use crossterm::event::KeyEvent;
+        use crossterm::event::KeyModifiers;
+
+        let (tx, _rx) = unbounded_channel::<AppEvent>();
+        let sender = AppEventSender::new(tx);
+        let mut composer = ChatComposer::new(
+            true,
+            sender,
+            false,
+            "Ask Codex to do anything".to_string(),
+            false,
+        );
+
+        type_chars_humanlike(&mut composer, &['/', 'r', 'e', 'v', 'i', 'e', 'w', ' ']);
+        type_chars_humanlike(&mut composer, &['f', 'i', 'x', ' ', 't', 'h', 'i', 's']);
+
+        let (result, _needs_redraw) =
+            composer.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        match result {
+            InputResult::CommandWithArgs(cmd, args) => {
+                assert_eq!(cmd, SlashCommand::Review);
+                assert_eq!(args, "fix this");
+            }
+            InputResult::Command(cmd) => {
+                panic!("expected args for '/review', got bare command: {cmd:?}")
+            }
+            InputResult::Submitted(text) => {
+                panic!("expected command dispatch, got literal submit: {text}")
+            }
+            InputResult::None => panic!("expected CommandWithArgs result for '/review'"),
         }
         assert!(composer.textarea.is_empty(), "composer should be cleared");
     }
@@ -2804,6 +2918,9 @@ mod tests {
             composer.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         match result {
             InputResult::Command(cmd) => assert_eq!(cmd.command(), "diff"),
+            InputResult::CommandWithArgs(_, _) => {
+                panic!("expected command dispatch without args for '/diff'")
+            }
             InputResult::Submitted(text) => {
                 panic!("expected command dispatch after Tab completion, got literal submit: {text}")
             }
@@ -2836,6 +2953,9 @@ mod tests {
         match result {
             InputResult::Command(cmd) => {
                 assert_eq!(cmd.command(), "mention");
+            }
+            InputResult::CommandWithArgs(_, _) => {
+                panic!("expected command dispatch without args for '/mention'")
             }
             InputResult::Submitted(text) => {
                 panic!("expected command dispatch, but composer submitted literal text: {text}")
@@ -4024,5 +4144,39 @@ mod tests {
             matches!(composer.active_popup, ActivePopup::None),
             "'/zzz' should not activate slash popup because it is not a prefix of any built-in command"
         );
+    }
+    #[test]
+    fn input_disabled_ignores_keypresses_and_hides_cursor() {
+        use crossterm::event::KeyCode;
+        use crossterm::event::KeyEvent;
+        use crossterm::event::KeyModifiers;
+
+        let (tx, _rx) = unbounded_channel::<AppEvent>();
+        let sender = AppEventSender::new(tx);
+        let mut composer = ChatComposer::new(
+            true,
+            sender,
+            false,
+            "Ask Codex to do anything".to_string(),
+            false,
+        );
+
+        composer.set_text_content("hello".to_string());
+        composer.set_input_enabled(false, Some("Input disabled for test.".to_string()));
+
+        let (result, needs_redraw) =
+            composer.handle_key_event(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+
+        assert_eq!(result, InputResult::None);
+        assert!(!needs_redraw);
+        assert_eq!(composer.current_text(), "hello");
+
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 40,
+            height: 5,
+        };
+        assert_eq!(composer.cursor_pos(area), None);
     }
 }
