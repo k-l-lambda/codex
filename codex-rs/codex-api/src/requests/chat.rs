@@ -291,6 +291,62 @@ impl<'a> ChatRequestBuilder<'a> {
             }
         }
 
+        // V5 SEQUENCE VALIDATION: OpenAI protocol requires assistant messages with tool_calls
+        // to be immediately followed by tool response messages. Remove any messages that
+        // violate this ordering constraint.
+        let mut i = 0;
+        while i < messages.len() {
+            if let Some(obj) = messages[i].as_object() {
+                // Check if this is an assistant message with tool_calls
+                if obj.get("role").and_then(|v| v.as_str()) == Some("assistant")
+                    && obj.contains_key("tool_calls")
+                {
+                    // Extract all tool_call_ids from this message
+                    let mut call_ids = std::collections::HashSet::new();
+                    if let Some(tool_calls) = obj.get("tool_calls").and_then(|v| v.as_array()) {
+                        for tc in tool_calls {
+                            if let Some(id) = tc.get("id").and_then(|v| v.as_str()) {
+                                call_ids.insert(id.to_string());
+                            }
+                        }
+                    }
+
+                    // Scan forward to find all corresponding tool responses
+                    let mut j = i + 1;
+                    let mut found_responses = std::collections::HashSet::new();
+
+                    while j < messages.len() {
+                        if let Some(next_obj) = messages[j].as_object() {
+                            let next_role = next_obj.get("role").and_then(|v| v.as_str());
+
+                            if next_role == Some("tool") {
+                                // This is a tool response
+                                if let Some(tool_call_id) = next_obj.get("tool_call_id").and_then(|v| v.as_str()) {
+                                    if call_ids.contains(tool_call_id) {
+                                        found_responses.insert(tool_call_id.to_string());
+                                    }
+                                }
+                                j += 1;
+                            } else {
+                                // Non-tool message found before all tool responses collected
+                                if found_responses.len() < call_ids.len() {
+                                    // Incomplete sequence! Remove the intruding message
+                                    messages.remove(j);
+                                    continue;
+                                } else {
+                                    // All responses found, this is the next turn
+                                    break;
+                                }
+                            }
+                        } else {
+                            j += 1;
+                        }
+                    }
+                }
+            }
+            i += 1;
+        }
+
         let payload = json!({
             "model": self.model,
             "messages": messages,
